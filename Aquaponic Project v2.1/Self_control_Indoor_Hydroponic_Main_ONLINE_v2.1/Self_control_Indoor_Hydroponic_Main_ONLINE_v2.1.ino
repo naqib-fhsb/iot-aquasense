@@ -133,6 +133,14 @@ long lastSensorReadMillis = 0;
 // die property value
 int dieNumberValue = 1;
 
+// Define the number of milliseconds in 4 days
+unsigned long fourDaysInMillis = 4L * 24L * 60L * 60L * 1000L;  
+
+unsigned long startTime;
+
+// initialize reset function
+void(* resetFunc) (void) = 0;
+
 // grab the current time from internet time service
 unsigned long getNow() {
   IPAddress address(129, 6, 15, 28);  // time.nist.gov NTP server
@@ -300,11 +308,14 @@ void connectMQTT(String deviceId, String username, String password) {
   while (retry < 10 && !mqtt_client->connected()) {
     if (mqtt_client->connect(deviceId.c_str(), username.c_str(), password.c_str())) {
       mqttConnected = true;
+      return;
     } else {
       delay(2000);
       retry++;
     }
   }
+  Serial_printf("MQTT connection failed after 10 retries.");
+  resetFunc();
 }
 
 // create an IoT Hub SAS token for authentication
@@ -539,8 +550,9 @@ void AZURE() {
         lastPropertyMillis = millis();
       }
     }
-  } else
+  } else {
     ConnAzure();
+  }
 }
 
 void Maintenance() {
@@ -726,34 +738,46 @@ void ConnAzure() {
   String url = iothubHost + urlEncode(String("/devices/" + deviceId).c_str());
   char* devKey = (char*)sharedAccessKey.c_str();
   long expire = getNow() + 864000;
-  String sasToken = createIotHubSASToken(devKey, url, expire);
-  String username = iothubHost + "/" + deviceId + "/api-version=2016-11-14";
 
-  // connect to the IoT Hub MQTT broker
-  wifiClient.connect(iothubHost.c_str(), 8883);
-  mqtt_client = new PubSubClient(iothubHost.c_str(), 8883, wifiClient);
-  connectMQTT(deviceId, username, sasToken);
-  mqtt_client->setCallback(callback);
+  if (!mqtt_client->connected()) {
+    Serial_printf("MQTT Disconnected, trying to reconnect...");
 
-  // // add subscriptions
-  mqtt_client->subscribe(IOT_TWIN_RESULT_TOPIC);         // twin results
-  mqtt_client->subscribe(IOT_TWIN_DESIRED_PATCH_TOPIC);  // twin desired properties
-  String c2dMessageTopic = IOT_C2D_TOPIC;
-  c2dMessageTopic.replace("{device_id}", deviceId);
-  mqtt_client->subscribe(c2dMessageTopic.c_str());   // cloud to device messages
-  mqtt_client->subscribe(IOT_DIRECT_MESSAGE_TOPIC);  // direct messages
+    String sasToken = createIotHubSASToken(devKey, url, expire);
+    String username = iothubHost + "/" + deviceId + "/api-version=2016-11-14";
 
-  // request full digital twin update
-  String topic = (String)IOT_TWIN_REQUEST_TWIN_TOPIC;
-  char buff[20];
-  topic.replace("{request_id}", itoa(requestId, buff, 10));
-  twinRequestId = requestId;
-  requestId++;
-  mqtt_client->publish(topic.c_str(), "");
+    // connect to the IoT Hub MQTT broker
+    wifiClient.connect(iothubHost.c_str(), 8883);
+    mqtt_client = new PubSubClient(iothubHost.c_str(), 8883, wifiClient);
+    connectMQTT(deviceId, username, sasToken);
 
-  // initialize timers
-  lastTelemetryMillis = millis();
-  lastPropertyMillis = millis();
+    // If still not connected after retries, handle the failure
+    if (!mqtt_client->connected()) {
+      Serial_printf("Failed to reconnect to MQTT, will retry later.");
+      return;  // Exit if unable to connect after retrying
+    }
+
+    mqtt_client->setCallback(callback);
+
+    // // add subscriptions
+    mqtt_client->subscribe(IOT_TWIN_RESULT_TOPIC);         // twin results
+    mqtt_client->subscribe(IOT_TWIN_DESIRED_PATCH_TOPIC);  // twin desired properties
+    String c2dMessageTopic = IOT_C2D_TOPIC;
+    c2dMessageTopic.replace("{device_id}", deviceId);
+    mqtt_client->subscribe(c2dMessageTopic.c_str());   // cloud to device messages
+    mqtt_client->subscribe(IOT_DIRECT_MESSAGE_TOPIC);  // direct messages
+
+    // request full digital twin update
+    String topic = (String)IOT_TWIN_REQUEST_TWIN_TOPIC;
+    char buff[20];
+    topic.replace("{request_id}", itoa(requestId, buff, 10));
+    twinRequestId = requestId;
+    requestId++;
+    mqtt_client->publish(topic.c_str(), "");
+
+    // initialize timers
+    lastTelemetryMillis = millis();
+    lastPropertyMillis = millis();
+  }
 }
 
 void setup() {
@@ -789,6 +813,7 @@ void setup() {
   lcd.print("                  ");
   lcd.setCursor(0, 1);
   lcd.print("Connected");
+  startTime = millis();
   ConnAzure();
   }
 
@@ -802,9 +827,22 @@ void setup() {
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(wifi_ssid, wifi_password);
-  } else if (WiFi.status() == WL_CONNECTED)
-    AZURE();
+    // Buat checking wifi attempts, kalau gagal ia cuba connect semula
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+        WiFi.begin(wifi_ssid, wifi_password);
+        delay(5000); // wait 5 seconds before retry
+        attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        AZURE(); // Berjaya connect wifi baru execute function
+    } else {
+        Serial_printf("Failed to reconnect to WiFi"); // Kalau attempt gagal melebihi 5 kali
+        resetFunc();
+    }
+  } else {
+    AZURE(); 
+  }
   if (Counter < 1) {
     CollectData();
     FuzzyControl();
@@ -828,6 +866,9 @@ void loop() {
   } else {
     Mode = 1;
     Maintenance();
+  }
+  if (millis() - startTime >= fourDaysInMillis) {
+    resetFunc();  // Trigger the reset after 4 days
   }
   delay(1000);
 }
