@@ -11,6 +11,7 @@
 #include <SPI.h>
 #include <WiFiNINA.h>
 #include <WiFiUdp.h>
+#include <NTPClient.h>
 #include <Wire.h>
 #include <math.h>
 #include <PubSubClient.h>
@@ -52,9 +53,17 @@ int twinRequestId = -1;
 long lastTelemetryMillis = 0;
 long lastPropertyMillis = 0;
 long lastSensorReadMillis = 0;
-
+bool feederOn = false;
 // die property value
 int dieNumberValue = 1;
+
+// Define the number of milliseconds in 4 days
+unsigned long fourDaysInMillis = 4L * 24L * 60L * 60L * 1000L;  
+
+unsigned long startTime;
+
+// initialize reset function
+void(* resetFunc) (void) = 0;
 
 // grab the current time from internet time service
 unsigned long getNow() {
@@ -226,6 +235,7 @@ void connectMQTT(String deviceId, String username, String password) {
     if (mqtt_client->connect(deviceId.c_str(), username.c_str(), password.c_str())) {
       Serial.println("===> mqtt connected");
       mqttConnected = true;
+      return;
     } else {
       Serial.print("---> mqtt failed, rc=");
       Serial.println(mqtt_client->state());
@@ -233,6 +243,8 @@ void connectMQTT(String deviceId, String username, String password) {
       retry++;
     }
   }
+  Serial_printf("MQTT connection failed after 10 retries.");
+  resetFunc();
 }
 
 // create an IoT Hub SAS token for authentication
@@ -305,13 +317,13 @@ void UVLightActive(int Mode) {
 void AutoRelay() {
   Mode = digitalRead(TriggerRelay);  // receive byte as an integer
   if (Mode > 0) {
-    digitalWrite(FeederRelayPIN, HIGH);
+    //digitalWrite(FeederRelayPIN, HIGH);
     digitalWrite(WateringRelayPIN, HIGH);
     Serial.println("All Relay ON");
   }
 
   else {
-    digitalWrite(FeederRelayPIN, LOW);
+    //digitalWrite(FeederRelayPIN, LOW);
     digitalWrite(WateringRelayPIN, LOW);
     Serial.println("All Relay OFF");
   }
@@ -379,8 +391,9 @@ void AZURE() {
 
       lastPropertyMillis = millis();
     }
-  } else
+  } else {
     ConnAzure();
+  }
 }
 
 void ConnAzure() {
@@ -390,34 +403,46 @@ void ConnAzure() {
   String url = iothubHost + urlEncode(String("/devices/" + deviceId).c_str());
   char* devKey = (char*)sharedAccessKey.c_str();
   long expire = getNow() + 864000;
-  String sasToken = createIotHubSASToken(devKey, url, expire);
-  String username = iothubHost + "/" + deviceId + "/api-version=2016-11-14";
 
-  // connect to the IoT Hub MQTT broker
-  wifiClient.connect(iothubHost.c_str(), 8883);
-  mqtt_client = new PubSubClient(iothubHost.c_str(), 8883, wifiClient);
-  connectMQTT(deviceId, username, sasToken);
-  mqtt_client->setCallback(callback);
+  if (!mqtt_client->connected()) {
+      Serial_printf("MQTT Disconnected, trying to reconnect...");
 
-  // // add subscriptions
-  mqtt_client->subscribe(IOT_TWIN_RESULT_TOPIC);         // twin results
-  mqtt_client->subscribe(IOT_TWIN_DESIRED_PATCH_TOPIC);  // twin desired properties
-  String c2dMessageTopic = IOT_C2D_TOPIC;
-  c2dMessageTopic.replace("{device_id}", deviceId);
-  mqtt_client->subscribe(c2dMessageTopic.c_str());   // cloud to device messages
-  mqtt_client->subscribe(IOT_DIRECT_MESSAGE_TOPIC);  // direct messages
+      String sasToken = createIotHubSASToken(devKey, url, expire);
+      String username = iothubHost + "/" + deviceId + "/api-version=2016-11-14";
 
-  // request full digital twin update
-  String topic = (String)IOT_TWIN_REQUEST_TWIN_TOPIC;
-  char buff[20];
-  topic.replace("{request_id}", itoa(requestId, buff, 10));
-  twinRequestId = requestId;
-  requestId++;
-  mqtt_client->publish(topic.c_str(), "");
+      // connect to the IoT Hub MQTT broker
+      wifiClient.connect(iothubHost.c_str(), 8883);
+      mqtt_client = new PubSubClient(iothubHost.c_str(), 8883, wifiClient);
+      connectMQTT(deviceId, username, sasToken);
 
-  // initialize timers
-  lastTelemetryMillis = millis();
-  lastPropertyMillis = millis();
+      // If still not connected after retries, handle the failure
+      if (!mqtt_client->connected()) {
+        Serial_printf("Failed to reconnect to MQTT, will retry later.");
+        return;  // Exit if unable to connect after retrying
+      }
+
+      mqtt_client->setCallback(callback);
+
+      // // add subscriptions
+      mqtt_client->subscribe(IOT_TWIN_RESULT_TOPIC);         // twin results
+      mqtt_client->subscribe(IOT_TWIN_DESIRED_PATCH_TOPIC);  // twin desired properties
+      String c2dMessageTopic = IOT_C2D_TOPIC;
+      c2dMessageTopic.replace("{device_id}", deviceId);
+      mqtt_client->subscribe(c2dMessageTopic.c_str());   // cloud to device messages
+      mqtt_client->subscribe(IOT_DIRECT_MESSAGE_TOPIC);  // direct messages
+
+      // request full digital twin update
+      String topic = (String)IOT_TWIN_REQUEST_TWIN_TOPIC;
+      char buff[20];
+      topic.replace("{request_id}", itoa(requestId, buff, 10));
+      twinRequestId = requestId;
+      requestId++;
+      mqtt_client->publish(topic.c_str(), "");
+
+      // initialize timers
+      lastTelemetryMillis = millis();
+      lastPropertyMillis = millis();
+  }
 }
 
 void setup() {
@@ -444,14 +469,64 @@ void setup() {
     digitalWrite(LED, HIGH);
     ConnAzure();
   }
+
+  // Initialize NTP client
+  timeClient.begin();
+  // Set time zone offset for Malaysia (UTC +8)
+  timeClient.setTimeOffset(28800);  // Malaysia Time: UTC +8 = 8 * 3600 seconds
+}
+
+void CheckFeedingTime() {
+	timeClient.update(); // Update the time from NTP server
+	
+    // Get the current hour, minute, and second from the NTP client
+	int currentHour = timeClient.getHours();
+	int currentMinute = timeClient.getMinutes();
+	int currentSecond = timeClient.getSeconds();
+	
+	if (currentHour == 8 && currentMinute == 0) {
+		if (currentSecond < 6) {
+			feederOn = true;
+		} else {
+			feederOn = false;			
+		}
+	}
+}
+
+void feedingFish() {
+	if (feederOn) {
+		digitalWrite(FeederRelayPIN, HIGH);
+	} else {
+		digitalWrite(FeederRelayPIN, LOW);
+	}
 }
 
 void loop() {
-  delay(1000);
+  CheckFeedingTime();
+  feedingFish();
   CollectData();
   Transducer();
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.begin(wifi_ssid, wifi_password);
-  } else if (WiFi.status() == WL_CONNECTED)
+    // Buat checking wifi attempts, kalau gagal ia cuba connect semula
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+        WiFi.begin(wifi_ssid, wifi_password);
+        delay(5000); // wait 5 seconds before retry
+        attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        AZURE(); // Berjaya connect wifi baru execute function
+    } else {
+        Serial_printf("Failed to reconnect to WiFi"); // Kalau attempt gagal melebihi 5 kali
+        resetFunc();
+    }
+  } else {
     AZURE();
+  }
+
+  if (millis() - startTime >= fourDaysInMillis) {
+    resetFunc();  // Trigger the reset after 4 days
+  }
+  delay(1000);
 }
